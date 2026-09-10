@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_bluetooth_serial_plus/flutter_bluetooth_serial_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -8,8 +10,42 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'obd_pids.dart';
 import 'obd_service.dart';
+import 'supercar_gauge.dart';
 
-void main() => runApp(const ObdApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await _initBackgroundService();
+  runApp(const ObdApp());
+}
+
+Future<void> _initBackgroundService() async {
+  final service = FlutterBackgroundService();
+  await service.configure(
+    androidConfiguration: AndroidConfiguration(
+      onStart: _onServiceStart,
+      autoStart: false,
+      isForegroundMode: true,
+      notificationChannelId: 'obd2_foreground',
+      initialNotificationTitle: 'AppOBD2',
+      initialNotificationContent: 'กำลังเชื่อมต่อ OBD2...',
+      foregroundServiceNotificationId: 888,
+      foregroundServiceTypes: [AndroidForegroundType.connectedDevice],
+    ),
+    iosConfiguration: IosConfiguration(autoStart: false, onForeground: _onServiceStart, onBackground: _onIosBackground),
+  );
+}
+
+@pragma('vm:entry-point')
+void _onServiceStart(ServiceInstance service) async {
+  service.on('stop').listen((_) async {
+    await service.stopSelf();
+  });
+}
+
+@pragma('vm:entry-point')
+bool _onIosBackground(ServiceInstance service) {
+  return true;
+}
 
 class ObdApp extends StatelessWidget {
   const ObdApp({super.key});
@@ -17,8 +53,15 @@ class ObdApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'AppOBD2',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData.dark(useMaterial3: true).copyWith(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.cyan, brightness: Brightness.dark),
+        scaffoldBackgroundColor: const Color(0xFF0A0A0A),
+        colorScheme: ColorScheme.dark(
+          primary: const Color(0xFFFF3B30),
+          secondary: const Color(0xFFFF9500),
+          surface: const Color(0xFF1A1A1A),
+          brightness: Brightness.dark,
+        ),
       ),
       home: const DashboardPage(),
     );
@@ -58,7 +101,7 @@ class _DashboardPageState extends State<DashboardPage> {
   void _addLog(String s) => setState(() => _log = '$s\n$_log');
 
   Future<void> _refreshBonded() async {
-    await [Permission.bluetooth, Permission.bluetoothScan, Permission.bluetoothConnect, Permission.location].request();
+    await [Permission.bluetooth, Permission.bluetoothScan, Permission.bluetoothConnect, Permission.location, Permission.notification].request();
     try {
       final list = await _obd.bondedDevices();
       final prefs = await SharedPreferences.getInstance();
@@ -86,6 +129,8 @@ class _DashboardPageState extends State<DashboardPage> {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('last_obd_addr', dev.address);
       _addLog('Connected to ${dev.name ?? dev.address}');
+      // เปิด foreground service กัน Android kill
+      await FlutterBackgroundService().startService();
       _startPoll();
     } catch (e) {
       _addLog('Connect failed: $e');
@@ -112,12 +157,22 @@ class _DashboardPageState extends State<DashboardPage> {
     _poll?.cancel();
     _polling = false;
     _obd.disconnect();
+    // ปิด foreground service
+    FlutterBackgroundService().invoke('stop');
     setState(() {});
   }
 
   @override
   Widget build(BuildContext context) {
     final connected = _obd.state == ObdConnState.connected;
+    final rpm = _values['010C'] ?? 0;
+    final speed = _values['010D'] ?? 0;
+    final load = _values['0104'] ?? 0;
+    final coolant = _values['0105'] ?? 0;
+    final intake = _values['010F'] ?? 0;
+    final throttle = _values['0111'] ?? 0;
+    final fuel = _values['012F'] ?? 0;
+    final battery = _values['0142'] ?? 0;
     return Scaffold(
       appBar: AppBar(
         title: const Text('AppOBD2'),
@@ -126,74 +181,138 @@ class _DashboardPageState extends State<DashboardPage> {
           IconButton(icon: const Icon(Icons.bluetooth), onPressed: _obd.openBluetoothSettings, tooltip: 'BT settings'),
         ],
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const Text('ELM327 Adapter', style: TextStyle(fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 8),
-                    DropdownButton<BluetoothDevice>(
-                      value: _bonded.contains(_selected) ? _selected : null,
-                      hint: const Text('Select paired device'),
-                      isExpanded: true,
-                      items: _bonded.map((d) => DropdownMenuItem(value: d, child: Text('${d.name ?? 'Unknown'} (${d.address})'))).toList(),
-                      onChanged: connected ? null : (d) => setState(() => _selected = d),
-                    ),
-                    const SizedBox(height: 8),
-                    Row(children: [
-                      Expanded(child: ElevatedButton.icon(onPressed: connected ? null : _connect, icon: const Icon(Icons.link), label: const Text('Connect'))),
-                      const SizedBox(width: 8),
-                      Expanded(child: OutlinedButton.icon(onPressed: connected ? _disconnect : null, icon: const Icon(Icons.link_off), label: const Text('Disconnect'))),
-                    ]),
-                    const SizedBox(height: 4),
-                    Text(_obd.statusMsg, style: Theme.of(context).textTheme.bodySmall),
-                  ],
+      body: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1A1A1A),
+              border: Border(bottom: BorderSide(color: Colors.grey.shade900)),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  connected ? Icons.bluetooth_connected : Icons.bluetooth_disabled,
+                  color: connected ? const Color(0xFFFF3B30) : Colors.grey,
+                  size: 20,
                 ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _obd.statusMsg,
+                    style: TextStyle(color: Colors.grey.shade400, fontSize: 12),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (_bonded.isNotEmpty) ...[
+                  DropdownButton<BluetoothDevice>(
+                    value: _bonded.contains(_selected) ? _selected : null,
+                    hint: const Text('Select', style: TextStyle(fontSize: 12)),
+                    underline: const SizedBox(),
+                    isDense: true,
+                    items: _bonded.map((d) => DropdownMenuItem(
+                      value: d,
+                      child: Text('${d.name ?? 'Unknown'}', style: const TextStyle(fontSize: 12)),
+                    )).toList(),
+                    onChanged: connected ? null : (d) => setState(() => _selected = d),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                ElevatedButton(
+                  onPressed: connected ? _disconnect : _connect,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: connected ? Colors.grey.shade800 : const Color(0xFFFF3B30),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    minimumSize: Size.zero,
+                    textStyle: const TextStyle(fontSize: 12),
+                  ),
+                  child: Text(connected ? 'Disconnect' : 'Connect'),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      SupercarGauge(
+                        label: 'RPM',
+                        unit: 'x1000',
+                        value: rpm / 1000,
+                        maxValue: 8,
+                        divisions: 8,
+                        color: const Color(0xFFFF3B30),
+                      ),
+                      SupercarGauge(
+                        label: 'SPEED',
+                        unit: 'km/h',
+                        value: speed,
+                        maxValue: 260,
+                        divisions: 10,
+                        color: const Color(0xFFFF9500),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 24),
+                  Row(
+                    children: [
+                      _buildInfoCard('ENGINE LOAD', '${load.toStringAsFixed(0)}%', Icons.engineering),
+                      _buildInfoCard('COOLANT', '${coolant.toStringAsFixed(0)}°C', Icons.thermostat),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      _buildInfoCard('INTAKE', '${intake.toStringAsFixed(0)}°C', Icons.air),
+                      _buildInfoCard('THROTTLE', '${throttle.toStringAsFixed(0)}%', Icons.speed),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      _buildInfoCard('FUEL', '${fuel.toStringAsFixed(0)}%', Icons.local_gas_station),
+                      _buildInfoCard('BATTERY', '${battery.toStringAsFixed(1)}V', Icons.battery_charging_full),
+                    ],
+                  ),
+                ],
               ),
             ),
-            const SizedBox(height: 8),
-            GridView.builder(
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 2, childAspectRatio: 1.6, crossAxisSpacing: 8, mainAxisSpacing: 8),
-              itemCount: kDefaultPids.length,
-              itemBuilder: (ctx, i) {
-                final pid = kDefaultPids[i];
-                final v = _values[pid.pid];
-                return Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(10),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Text(pid.name, style: Theme.of(context).textTheme.labelMedium),
-                        const SizedBox(height: 4),
-                        Text(v == null ? '--' : _fmt(pid, v), style: Theme.of(context).textTheme.headlineSmall?.copyWith(color: Colors.cyanAccent, fontWeight: FontWeight.bold)),
-                        Text(pid.unit, style: Theme.of(context).textTheme.bodySmall),
-                      ],
-                    ),
-                  ),
-                );
-              },
-            ),
-            const SizedBox(height: 8),
-            Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('Log', style: TextStyle(fontWeight: FontWeight.bold)), const SizedBox(height: 4), Text(_log.isEmpty ? '(empty)' : _log, style: const TextStyle(fontFamily: 'monospace', fontSize: 11))]))),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
 
-  String _fmt(ObdPid pid, double v) {
-    if (pid.unit == 'rpm' || pid.unit == 'km/h') return v.toStringAsFixed(0);
-    if (pid.unit == 'V') return v.toStringAsFixed(1);
-    return v.toStringAsFixed(1);
+  Widget _buildInfoCard(String label, String value, IconData icon) {
+    return Expanded(
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 4),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1A1A1A),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.grey.shade900),
+        ),
+        child: Row(
+          children: [
+            Icon(icon, color: const Color(0xFFFF9500), size: 20),
+            const SizedBox(width: 8),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label, style: TextStyle(color: Colors.grey.shade500, fontSize: 10, letterSpacing: 1)),
+                Text(value, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }

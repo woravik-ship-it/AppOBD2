@@ -40,6 +40,9 @@ dependencies:
   shared_preferences: ^2.3.2
   # กันจอดับตอนขับรถ
   wakelock_plus: ^1.2.8
+  # Foreground service - กัน Android kill app ตอนขับรถ
+  flutter_background_service: ^5.1.0
+  flutter_background_service_android: ^6.2.7
 
 dev_dependencies:
   flutter_test:
